@@ -145,7 +145,7 @@ Canonical `load_name` is decided at build time:
 
 - use the frontmatter name that Hermes exposes when it is uniquely loadable;
 - use the relative categorized path when Hermes requires it to disambiguate a filesystem collision;
-- preserve `plugin:skill` for plugin skills;
+- plugin skills are explicitly unsupported in this MVP;
 - omit any entry whose load target cannot be proven to resolve under the pinned Hermes rules.
 
 Never derive a skill name at query time by taking `Path(file).parent.name`; references can be nested, frontmatter names can differ from directory names, and plugin/collision names are qualified.
