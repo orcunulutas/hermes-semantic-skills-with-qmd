@@ -1,4 +1,7 @@
 id: hermes-semantic-skills-with-qmd
 name: Hermes Semantic Skills with QMD
 description: Full-content skill discovery using QMD
+version: 0.1.1
+provides_tools:
+  - skill_search
 entrypoint: __init__:register
