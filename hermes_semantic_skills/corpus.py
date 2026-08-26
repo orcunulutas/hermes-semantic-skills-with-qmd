@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import shutil
+import uuid
+import time
 from pathlib import Path
 from typing import Dict, List, Set, Any
 import hashlib
@@ -11,7 +13,6 @@ from .hermes_adapter import ResolvedSkill
 logger = logging.getLogger(__name__)
 
 def is_subpath(child: Path, parent: Path) -> bool:
-    """Check if child is securely a subpath of parent (resolves symlinks and prevents traversal)."""
     try:
         resolved_child = child.resolve()
         resolved_parent = parent.resolve()
@@ -20,10 +21,6 @@ def is_subpath(child: Path, parent: Path) -> bool:
         return False
 
 def discover_markdown_files(source_dir: str) -> List[str]:
-    """
-    Discover all allowed markdown files for a skill.
-    Must ONLY include SKILL.md and references/**/*.md.
-    """
     allowed_files = []
     base_path = Path(source_dir)
 
@@ -35,7 +32,6 @@ def discover_markdown_files(source_dir: str) -> List[str]:
     if references_dir.is_dir() and not references_dir.is_symlink():
         for md_file in references_dir.rglob("*.md"):
             if md_file.is_file() and not md_file.is_symlink():
-                # Enforce resolved-path containment
                 if is_subpath(md_file, base_path):
                     rel_path = md_file.relative_to(base_path).as_posix()
                     allowed_files.append(rel_path)
@@ -43,7 +39,6 @@ def discover_markdown_files(source_dir: str) -> List[str]:
     return allowed_files
 
 def calculate_file_hash(filepath: Path) -> str:
-    """Calculate SHA256 fingerprint for a file."""
     sha256 = hashlib.sha256()
     with open(filepath, "rb") as f:
         while True:
@@ -59,18 +54,18 @@ def build_corpus(
 ) -> Dict[str, Any]:
     """
     Build the deterministic corpus and generate the manifest atomically.
+    We build a complete generation in a temporary directory, and then promote it via symlinks
+    or directory renaming so the old generation remains intact if something fails.
     Returns the manifest dictionary.
     """
     base_output = Path(output_dir)
 
-    # We will build into a temporary directory first.
-    temp_dir = base_output / "corpus.tmp"
-    final_dir = base_output / "corpus"
+    generation_id = str(uuid.uuid4())
+    generation_dir = base_output / "generations" / generation_id
+    temp_dir = base_output / "generations" / f"{generation_id}.tmp"
 
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
-
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    corpus_dir = temp_dir / "corpus"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entries = []
 
@@ -82,7 +77,7 @@ def build_corpus(
         if not allowed_files:
             continue
 
-        skill_corpus_dir = temp_dir / skill_id
+        skill_corpus_dir = corpus_dir / skill_id
         skill_corpus_dir.mkdir(parents=True, exist_ok=True)
 
         for rel_path in allowed_files:
@@ -108,30 +103,35 @@ def build_corpus(
 
     manifest = {
         "version": 1,
+        "generation": generation_id,
         "entries": manifest_entries
     }
 
-    manifest_path_tmp = base_output / "manifest.json.tmp"
-    manifest_path_final = base_output / "manifest.json"
-
-    with open(manifest_path_tmp, "w", encoding="utf-8") as f:
+    manifest_path = temp_dir / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
-    # Atomic promotion
-    # First, handle the directory.
-    # POSIX rename allows overwriting an empty directory, but usually not a full one.
-    # To swap a full directory atomically (or close to it) without failing, we can move the old one out of the way.
-    if final_dir.exists():
-        old_dir = base_output / "corpus.old"
-        if old_dir.exists():
-            shutil.rmtree(old_dir)
-        os.rename(final_dir, old_dir)
-        os.rename(temp_dir, final_dir)
-        shutil.rmtree(old_dir)
-    else:
-        os.rename(temp_dir, final_dir)
+    # Promote temporary generation folder to final generation folder
+    os.rename(temp_dir, generation_dir)
 
-    # Promote manifest atomically
-    os.replace(manifest_path_tmp, manifest_path_final)
+    # Update current symlinks atomically
+    current_corpus_link = base_output / "corpus"
+    current_manifest_link = base_output / "manifest.json"
+
+    tmp_corpus_link = base_output / "corpus.tmp"
+    tmp_manifest_link = base_output / "manifest.json.tmp"
+
+    if tmp_corpus_link.exists() or tmp_corpus_link.is_symlink():
+        tmp_corpus_link.unlink()
+    if tmp_manifest_link.exists() or tmp_manifest_link.is_symlink():
+        tmp_manifest_link.unlink()
+
+    # Create symlinks pointing to the new generation
+    os.symlink(generation_dir / "corpus", tmp_corpus_link)
+    os.symlink(generation_dir / "manifest.json", tmp_manifest_link)
+
+    # Atomically replace the existing current links
+    os.replace(tmp_corpus_link, current_corpus_link)
+    os.replace(tmp_manifest_link, current_manifest_link)
 
     return manifest
