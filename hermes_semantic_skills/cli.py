@@ -11,8 +11,6 @@ from .corpus import build_corpus
 logger = logging.getLogger(__name__)
 
 def get_base_dir() -> Path:
-    # Use standard hermes config dir or a local one for MVP if preferred.
-    # We will use ~/.hermes/semantic-skills to isolate from default index.
     home = Path.home()
     base = home / ".hermes" / "semantic-skills"
     base.mkdir(parents=True, exist_ok=True)
@@ -20,7 +18,7 @@ def get_base_dir() -> Path:
 
 def check_qmd_executable() -> bool:
     try:
-        subprocess.run(["qmd", "--version"], capture_output=True, check=True)
+        subprocess.run(["qmd", "--version"], capture_output=True, check=True, timeout=10)
         return True
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
@@ -32,7 +30,7 @@ def command_doctor(args):
     print(f"  QMD Executable: {'OK' if has_qmd else 'MISSING'}")
 
     base_dir = get_base_dir()
-    manifest_path = base_dir / "manifest.json"
+    manifest_path = base_dir / "current" / "manifest.json"
     if manifest_path.exists():
         print("  Manifest: PRESENT")
     else:
@@ -52,37 +50,34 @@ def command_build(args):
     print(f"Building corpus in {base_dir}...")
     build_corpus(skills, str(base_dir))
 
-    corpus_dir = base_dir / "corpus"
+    # Target `current/corpus` since the single generation pointer is there
+    corpus_dir = base_dir / "current" / "corpus"
 
-    # Check if we need to add the collection.
-    # Actually QMD requires adding the collection explicitly first.
-    # `qmd --index hermes-skills collection add <corpus_dir> --name hermes-skills`
-    # Let's try adding it first. If it exists, it might fail or just warn, we'll ignore errors or check first.
-
-    # 1. Try to add collection.
     try:
         subprocess.run(
             [
                 "qmd", "--index", "hermes-skills",
-                "collection", "add", str(corpus_dir),
+                "collection", "add", str(corpus_dir.resolve()),
                 "--name", "hermes-skills"
             ],
             capture_output=True,
-            check=False
+            check=False,
+            timeout=30
         )
     except Exception as e:
         logger.warning(f"Error adding collection: {e}")
 
-    # 2. Update and Embed
     print("Updating QMD index...")
     subprocess.run(
         ["qmd", "--index", "hermes-skills", "update"],
-        check=True
+        check=True,
+        timeout=1800
     )
     print("Generating embeddings...")
     subprocess.run(
         ["qmd", "--index", "hermes-skills", "embed"],
-        check=True
+        check=True,
+        timeout=3600
     )
 
     print("Build complete.")
@@ -95,18 +90,18 @@ def command_status(args):
 
     subprocess.run(
         ["qmd", "--index", "hermes-skills", "collection", "list"],
-        check=False
+        check=False,
+        timeout=30
     )
 
 def command_remove(args):
     """Remove the index and corpus."""
     base_dir = get_base_dir()
 
-    # Try to remove collection
     if check_qmd_executable():
         subprocess.run(
             ["qmd", "--index", "hermes-skills", "collection", "rm", "hermes-skills"],
-            capture_output=True, check=False
+            capture_output=True, check=False, timeout=30
         )
 
     import shutil

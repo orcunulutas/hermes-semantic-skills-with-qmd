@@ -1,6 +1,8 @@
 import json
 import logging
 import subprocess
+import time
+import os
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -67,22 +69,76 @@ def run_qmd_search(
         "-n", str(fetch_limit)
     ]
 
+    max_output_bytes = 5_000_000
+
     try:
-        # Popen is safer to bound stdout memory size before reading it fully
         proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             shell=False
         )
 
-        try:
-            stdout, stderr = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.communicate()
-            return format_error("qmd_timeout", "QMD search timed out.")
+        stdout_chunks = []
+        stderr_chunks = []
+        stdout_len = 0
+        stderr_len = 0
+
+        start_time = time.monotonic()
+        timeout = 30.0
+
+        import select
+        os.set_blocking(proc.stdout.fileno(), False)
+        os.set_blocking(proc.stderr.fileno(), False)
+
+        while True:
+            if time.monotonic() - start_time > timeout:
+                proc.kill()
+                proc.wait()
+                return format_error("qmd_timeout", "QMD search timed out.")
+
+            reads, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
+
+            for fd in reads:
+                data = fd.read(65536)
+                if data:
+                    if fd is proc.stdout:
+                        stdout_chunks.append(data)
+                        stdout_len += len(data)
+                        if stdout_len > max_output_bytes:
+                            proc.kill()
+                            proc.wait()
+                            return format_error("qmd_error", "QMD output exceeded safe limit.")
+                    else:
+                        stderr_chunks.append(data)
+                        stderr_len += len(data)
+                        if stderr_len > max_output_bytes:
+                            proc.kill()
+                            proc.wait()
+                            return format_error("qmd_error", "QMD output exceeded safe limit.")
+
+            if proc.poll() is not None:
+                # Read any remaining
+                for fd in [proc.stdout, proc.stderr]:
+                    while True:
+                        data = fd.read(65536)
+                        if not data:
+                            break
+                        if fd is proc.stdout:
+                            stdout_chunks.append(data)
+                            stdout_len += len(data)
+                        else:
+                            stderr_chunks.append(data)
+                            stderr_len += len(data)
+
+                        if stdout_len > max_output_bytes or stderr_len > max_output_bytes:
+                            proc.kill()
+                            proc.wait()
+                            return format_error("qmd_error", "QMD output exceeded safe limit.")
+                break
+
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
 
     except Exception as e:
         return format_error("qmd_error", f"Failed to execute qmd: {e}")
@@ -92,9 +148,6 @@ def run_qmd_search(
         if "model" in err_msg and ("not found" in err_msg or "load" in err_msg or "unavailable" in err_msg):
             return format_error("search_unavailable", f"QMD embedding model unavailable: {stderr.strip()[:200]}")
         return format_error("qmd_error", f"QMD exited with code {proc.returncode}: {stderr.strip()[:200]}")
-
-    if len(stdout) > 5_000_000:
-        return format_error("qmd_error", "QMD output exceeded safe limit.")
 
     try:
         qmd_output = json.loads(stdout)
