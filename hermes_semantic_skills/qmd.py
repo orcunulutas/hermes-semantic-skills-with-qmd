@@ -4,7 +4,8 @@ import subprocess
 import time
 import os
 import urllib.parse
-from pathlib import Path
+import re
+from pathlib import PurePosixPath, Path
 from typing import List, Dict, Any, Optional, Tuple
 
 from .manifest import Manifest
@@ -96,6 +97,10 @@ def _normalize_qmd_path(uri: str, index_name: str, collection_name: str) -> Opti
     Safely extract a relative manifest path from a QMD result path or URI.
     Returns None if malformed, insecure, or from wrong index/collection.
     """
+    # Reject any URI scheme other than qmd
+    if "://" in uri and not uri.startswith("qmd://"):
+        return None
+
     if uri.startswith("qmd://"):
         parsed = urllib.parse.urlparse(uri)
         if parsed.scheme != "qmd":
@@ -109,29 +114,41 @@ def _normalize_qmd_path(uri: str, index_name: str, collection_name: str) -> Opti
             if len(qs["index"]) != 1 or qs["index"][0] != index_name:
                 return None
 
-        # URI path starts with '/' because netloc is before it
         raw_path = parsed.path
         if not raw_path.startswith("/"):
             return None
 
+        # Reject malformed percent escapes
+        if re.search(r'%(?![a-fA-F0-9]{2})', raw_path):
+            return None
+
+        # Only URL-decode the path component
         decoded_path = urllib.parse.unquote(raw_path)
-        # Strip leading slash
         norm_path = decoded_path[1:]
     else:
-        # Fallback for plain relative path compatibility
-        norm_path = urllib.parse.unquote(uri)
+        # Do not URL-decode plain relative paths
+        norm_path = uri
 
-    # Security: reject backslashes, absolute paths, or traversal
+    # Use PurePosixPath to check traversal and absolute safely
     if "\\" in norm_path:
         return None
-    if norm_path.startswith("/"):
+
+    try:
+        p = PurePosixPath(norm_path)
+    except Exception:
         return None
 
-    parts = Path(norm_path).parts
-    if ".." in parts or "." in parts:
+    if p.is_absolute():
         return None
 
-    return Path(norm_path).as_posix()
+    if ".." in p.parts or "." in p.parts:
+        return None
+
+    result = p.as_posix()
+    if not result or result == ".":
+        return None
+
+    return result
 
 def run_qmd_search(
     query: str,
