@@ -17,9 +17,10 @@ def iter_resolved_skills() -> List[ResolvedSkill]:
     """
     Enumerate eligible installed skills using the pinned Hermes behavior.
     """
-    # Isolate imports to avoid requiring hermes-agent to load this module.
     try:
         from tools.skills_tool import skills_list, _find_all_skills
+        from agent.skill_utils import get_project_skills_dirs
+        from tools.skills_tool import _skills_dir
     except ImportError as e:
         raise ImportError("Hermes Agent >=0.20.5 (or pinned version) is required.") from e
 
@@ -38,38 +39,32 @@ def iter_resolved_skills() -> List[ResolvedSkill]:
     resolved: List[ResolvedSkill] = []
 
     try:
-        all_skills_list = _find_all_skills(skip_disabled=True)
         seen_names = set()
 
-        for skill_info in all_skills_list:
-            if not isinstance(skill_info, dict):
-                continue
+        def _process_file(skill_md: Path, is_project: bool):
+            with open(skill_md, "r", encoding="utf-8") as f:
+                content = f.read(1024)
 
-            load_name = skill_info.get("name")
+            load_name = skill_md.parent.name
+            if content.startswith("---"):
+                try:
+                    import yaml
+                    frontmatter = yaml.safe_load(content.split("---")[1])
+                    if frontmatter and isinstance(frontmatter, dict) and "name" in frontmatter:
+                        load_name = frontmatter["name"]
+                except Exception:
+                    pass
+
             if not load_name or load_name not in canonical_names:
-                continue
+                return
 
             if load_name in seen_names:
-                continue
+                return
+
             seen_names.add(load_name)
 
-            source_path_str = skill_info.get("original_path") or skill_info.get("path")
-            if not source_path_str:
-                continue
-
-            source_dir = str(Path(source_path_str).parent)
-
-            is_project = skill_info.get("is_project_skill", False)
-            source_type = skill_info.get("source", "")
-
-            if is_project or source_type == "project":
-                provenance = "project"
-            elif source_type == "external":
-                provenance = "external"
-            elif source_type == "plugin" or load_name.startswith("plugin:"):
-                provenance = "plugin"
-            else:
-                provenance = "profile"
+            source_dir = str(skill_md.parent)
+            provenance = "project" if is_project else "profile"
 
             skill_id_str = f"{provenance}:{source_dir}:{load_name}"
             skill_id = hashlib.sha256(skill_id_str.encode("utf-8")).hexdigest()[:16]
@@ -79,10 +74,17 @@ def iter_resolved_skills() -> List[ResolvedSkill]:
                 "load_name": load_name,
                 "source_dir": source_dir,
                 "provenance": provenance,
-                "category": skill_info.get("category")
+                "category": None
             })
 
+        for proj_dir in get_project_skills_dirs():
+            for f in Path(proj_dir).rglob("SKILL.md"):
+                _process_file(f, True)
+
+        for f in Path(_skills_dir()).rglob("SKILL.md"):
+            _process_file(f, False)
+
     except Exception as e:
-        logger.error(f"Failed to scan skills via _find_all_skills: {e}")
+        logger.error(f"Failed to scan skills: {e}")
 
     return resolved

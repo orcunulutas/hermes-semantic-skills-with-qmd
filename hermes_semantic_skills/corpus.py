@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 def is_subpath(child: Path, parent: Path) -> bool:
     """Check if child is securely a subpath of parent (resolves symlinks and prevents traversal)."""
     try:
-        # resolve() removes symlinks, '.' and '..'
         resolved_child = child.resolve()
         resolved_parent = parent.resolve()
         return resolved_parent in resolved_child.parents
@@ -59,16 +58,19 @@ def build_corpus(
     output_dir: str,
 ) -> Dict[str, Any]:
     """
-    Build the deterministic corpus and generate the manifest.
+    Build the deterministic corpus and generate the manifest atomically.
     Returns the manifest dictionary.
     """
     base_output = Path(output_dir)
-    corpus_dir = base_output / "corpus"
 
-    if corpus_dir.exists():
-        shutil.rmtree(corpus_dir)
+    # We will build into a temporary directory first.
+    temp_dir = base_output / "corpus.tmp"
+    final_dir = base_output / "corpus"
 
-    corpus_dir.mkdir(parents=True, exist_ok=True)
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_entries = []
 
@@ -80,7 +82,7 @@ def build_corpus(
         if not allowed_files:
             continue
 
-        skill_corpus_dir = corpus_dir / skill_id
+        skill_corpus_dir = temp_dir / skill_id
         skill_corpus_dir.mkdir(parents=True, exist_ok=True)
 
         for rel_path in allowed_files:
@@ -92,7 +94,6 @@ def build_corpus(
 
             fingerprint = calculate_file_hash(src_file)
 
-            # Record in manifest using relative paths inside corpus
             corpus_relative = Path(skill_id) / rel_path
 
             manifest_entries.append({
@@ -110,8 +111,27 @@ def build_corpus(
         "entries": manifest_entries
     }
 
-    manifest_path = base_output / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
+    manifest_path_tmp = base_output / "manifest.json.tmp"
+    manifest_path_final = base_output / "manifest.json"
+
+    with open(manifest_path_tmp, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
+
+    # Atomic promotion
+    # First, handle the directory.
+    # POSIX rename allows overwriting an empty directory, but usually not a full one.
+    # To swap a full directory atomically (or close to it) without failing, we can move the old one out of the way.
+    if final_dir.exists():
+        old_dir = base_output / "corpus.old"
+        if old_dir.exists():
+            shutil.rmtree(old_dir)
+        os.rename(final_dir, old_dir)
+        os.rename(temp_dir, final_dir)
+        shutil.rmtree(old_dir)
+    else:
+        os.rename(temp_dir, final_dir)
+
+    # Promote manifest atomically
+    os.replace(manifest_path_tmp, manifest_path_final)
 
     return manifest

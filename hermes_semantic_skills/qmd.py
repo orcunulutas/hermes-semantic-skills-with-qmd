@@ -20,8 +20,34 @@ def run_qmd_search(
     """
     Run QMD search, parse output, validate against manifest, and return JSON.
     """
-    # Fetch more file results than requested skills
     fetch_limit = min(50, max(20, limit * 5))
+
+    if not manifest_path:
+        from .cli import get_base_dir
+        manifest_path = str(get_base_dir() / "manifest.json")
+
+    if not Path(manifest_path).exists():
+        return format_error("index_not_initialized", "Manifest not found. Run build.")
+
+    try:
+        manifest = Manifest.load(manifest_path)
+    except Exception as e:
+        return format_error("index_inconsistent", f"Failed to load manifest: {e}")
+
+    # Check if QMD exists
+    try:
+        subprocess.run([qmd_executable, "--version"], capture_output=True, check=True)
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return format_error("qmd_missing", "qmd executable not found. Install QMD and run build.")
+
+    # Check if collection exists
+    try:
+        col_res = subprocess.run([qmd_executable, "--index", index_name, "collection", "list"], capture_output=True, text=True)
+        if collection_name not in col_res.stdout:
+            return format_error("collection_not_initialized", f"Collection {collection_name} not found. Rebuild index.")
+    except Exception:
+        # If this fails, we will catch the query error later, but we try to provide a specific error first.
+        pass
 
     cmd = [
         qmd_executable,
@@ -42,36 +68,22 @@ def run_qmd_search(
         )
     except subprocess.TimeoutExpired:
         return format_error("qmd_timeout", "QMD search timed out.")
-    except FileNotFoundError:
-        return format_error("qmd_missing", "qmd executable not found. Install QMD and run build.")
 
     if result.returncode != 0:
-        return format_error("qmd_error", f"QMD exited with code {result.returncode}")
+        err_msg = result.stderr.lower() if result.stderr else ""
+        if "model" in err_msg and ("not found" in err_msg or "load" in err_msg or "unavailable" in err_msg):
+            return format_error("search_unavailable", f"QMD embedding model unavailable: {result.stderr.strip()[:200]}")
+        return format_error("qmd_error", f"QMD exited with code {result.returncode}: {result.stderr.strip()[:200]}")
 
     try:
         qmd_output = json.loads(result.stdout)
     except json.JSONDecodeError:
         return format_error("qmd_error", "Malformed JSON from QMD.")
 
-    # QMD JSON shape typically:
-    # {"results": [{"file": "path/to/file.md", "score": 0.9, ...}, ...]}
-    # Check shape
     if not isinstance(qmd_output, dict) or "results" not in qmd_output:
         return format_error("qmd_error", "Unexpected JSON shape from QMD.")
 
     qmd_results = qmd_output["results"]
-
-    if not manifest_path:
-        from .cli import get_base_dir
-        manifest_path = str(get_base_dir() / "manifest.json")
-
-    if not Path(manifest_path).exists():
-        return format_error("index_not_initialized", "Manifest not found. Run build.")
-
-    try:
-        manifest = Manifest.load(manifest_path)
-    except Exception as e:
-        return format_error("index_inconsistent", f"Failed to load manifest: {e}")
 
     valid_hits = []
     for r in qmd_results:
@@ -92,7 +104,6 @@ def run_qmd_search(
         })
 
     if not valid_hits and qmd_results:
-        # All invalid?
         return format_error("index_inconsistent", "All results were unknown. Rebuild required.")
 
     from .ranking import rank_skills
