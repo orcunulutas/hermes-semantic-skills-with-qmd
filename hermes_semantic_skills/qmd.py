@@ -24,7 +24,7 @@ def run_qmd_search(
 
     if not manifest_path:
         from .cli import get_base_dir
-        manifest_path = str(get_base_dir() / "manifest.json")
+        manifest_path = str(get_base_dir() / "current" / "manifest.json")
 
     if not Path(manifest_path).exists():
         return format_error("index_not_initialized", "Manifest not found. Run build.")
@@ -36,17 +36,26 @@ def run_qmd_search(
 
     # Check if QMD exists
     try:
-        subprocess.run([qmd_executable, "--version"], capture_output=True, check=True)
+        subprocess.run([qmd_executable, "--version"], capture_output=True, check=True, timeout=5, shell=False)
+    except subprocess.TimeoutExpired:
+        return format_error("qmd_timeout", "QMD version check timed out.")
     except (subprocess.SubprocessError, FileNotFoundError):
         return format_error("qmd_missing", "qmd executable not found. Install QMD and run build.")
 
     # Check if collection exists
     try:
-        col_res = subprocess.run([qmd_executable, "--index", index_name, "collection", "list"], capture_output=True, text=True)
+        col_res = subprocess.run(
+            [qmd_executable, "--index", index_name, "collection", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            shell=False
+        )
         if collection_name not in col_res.stdout:
             return format_error("collection_not_initialized", f"Collection {collection_name} not found. Rebuild index.")
+    except subprocess.TimeoutExpired:
+        return format_error("qmd_timeout", "QMD collection list timed out.")
     except Exception:
-        # If this fails, we will catch the query error later, but we try to provide a specific error first.
         pass
 
     cmd = [
@@ -59,37 +68,63 @@ def run_qmd_search(
     ]
 
     try:
-        result = subprocess.run(
+        # Popen is safer to bound stdout memory size before reading it fully
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=30,
             shell=False
         )
-    except subprocess.TimeoutExpired:
-        return format_error("qmd_timeout", "QMD search timed out.")
 
-    if result.returncode != 0:
-        err_msg = result.stderr.lower() if result.stderr else ""
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return format_error("qmd_timeout", "QMD search timed out.")
+
+    except Exception as e:
+        return format_error("qmd_error", f"Failed to execute qmd: {e}")
+
+    if proc.returncode != 0:
+        err_msg = stderr.lower() if stderr else ""
         if "model" in err_msg and ("not found" in err_msg or "load" in err_msg or "unavailable" in err_msg):
-            return format_error("search_unavailable", f"QMD embedding model unavailable: {result.stderr.strip()[:200]}")
-        return format_error("qmd_error", f"QMD exited with code {result.returncode}: {result.stderr.strip()[:200]}")
+            return format_error("search_unavailable", f"QMD embedding model unavailable: {stderr.strip()[:200]}")
+        return format_error("qmd_error", f"QMD exited with code {proc.returncode}: {stderr.strip()[:200]}")
+
+    if len(stdout) > 5_000_000:
+        return format_error("qmd_error", "QMD output exceeded safe limit.")
 
     try:
-        qmd_output = json.loads(result.stdout)
-    except json.JSONDecodeError:
+        qmd_output = json.loads(stdout)
+    except Exception:
         return format_error("qmd_error", "Malformed JSON from QMD.")
 
-    if not isinstance(qmd_output, dict) or "results" not in qmd_output:
-        return format_error("qmd_error", "Unexpected JSON shape from QMD.")
+    if not isinstance(qmd_output, dict):
+        return format_error("qmd_error", "Unexpected JSON shape from QMD (not an object).")
 
-    qmd_results = qmd_output["results"]
+    qmd_results = qmd_output.get("results")
+    if not isinstance(qmd_results, list):
+        return format_error("qmd_error", "Unexpected JSON shape from QMD ('results' is not a list).")
 
     valid_hits = []
     for r in qmd_results:
+        if not isinstance(r, dict):
+            return format_error("qmd_error", "Unexpected JSON shape from QMD (result is not an object).")
+
         file_path = r.get("file")
-        if not file_path:
-            continue
+        score = r.get("score")
+
+        if not isinstance(file_path, str):
+            return format_error("qmd_error", "Unexpected JSON shape from QMD ('file' is not a string).")
+
+        if not isinstance(score, (int, float)):
+            return format_error("qmd_error", "Unexpected JSON shape from QMD ('score' is not numeric).")
+
+        import math
+        if not math.isfinite(score):
+            return format_error("qmd_error", "Unexpected JSON shape from QMD ('score' is not finite).")
 
         entry = manifest.get_entry_by_path(file_path)
         if not entry:
@@ -100,7 +135,7 @@ def run_qmd_search(
             "skill_id": entry["skill_id"],
             "load_name": entry["load_name"],
             "corpus_relative_path": entry["corpus_relative_path"],
-            "score": r.get("score", 0.0)
+            "score": score
         })
 
     if not valid_hits and qmd_results:

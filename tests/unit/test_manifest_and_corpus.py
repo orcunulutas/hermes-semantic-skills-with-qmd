@@ -58,6 +58,7 @@ def test_build_corpus_creates_manifest():
         assert "abcdef/SKILL.md" in corpus_relative_paths
         assert "abcdef/references/doc.md" in corpus_relative_paths
 
-        # Verify physical files
-        assert (out_dir / "corpus" / "abcdef" / "SKILL.md").exists()
-        assert (out_dir / "corpus" / "abcdef" / "references" / "doc.md").exists()
+        # Verify physical files. Since we use `current` symlink we check against it.
+        current_dir = out_dir / "current"
+        assert (current_dir / "corpus" / "abcdef" / "SKILL.md").exists()
+        assert (current_dir / "corpus" / "abcdef" / "references" / "doc.md").exists()

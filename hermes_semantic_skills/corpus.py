@@ -54,8 +54,8 @@ def build_corpus(
 ) -> Dict[str, Any]:
     """
     Build the deterministic corpus and generate the manifest atomically.
-    We build a complete generation in a temporary directory, and then promote it via symlinks
-    or directory renaming so the old generation remains intact if something fails.
+    We build a complete generation in a temporary directory, and then promote it via a single
+    current symlink swap so the old generation remains intact if something fails.
     Returns the manifest dictionary.
     """
     base_output = Path(output_dir)
@@ -114,24 +114,16 @@ def build_corpus(
     # Promote temporary generation folder to final generation folder
     os.rename(temp_dir, generation_dir)
 
-    # Update current symlinks atomically
-    current_corpus_link = base_output / "corpus"
-    current_manifest_link = base_output / "manifest.json"
+    # Single atomic pointer
+    current_link = base_output / "current"
+    tmp_link = base_output / "current.tmp"
 
-    tmp_corpus_link = base_output / "corpus.tmp"
-    tmp_manifest_link = base_output / "manifest.json.tmp"
+    if tmp_link.exists() or tmp_link.is_symlink():
+        tmp_link.unlink()
 
-    if tmp_corpus_link.exists() or tmp_corpus_link.is_symlink():
-        tmp_corpus_link.unlink()
-    if tmp_manifest_link.exists() or tmp_manifest_link.is_symlink():
-        tmp_manifest_link.unlink()
+    os.symlink(generation_dir.relative_to(base_output), tmp_link)
 
-    # Create symlinks pointing to the new generation
-    os.symlink(generation_dir / "corpus", tmp_corpus_link)
-    os.symlink(generation_dir / "manifest.json", tmp_manifest_link)
-
-    # Atomically replace the existing current links
-    os.replace(tmp_corpus_link, current_corpus_link)
-    os.replace(tmp_manifest_link, current_manifest_link)
+    # Atomically replace the existing current link
+    os.replace(tmp_link, current_link)
 
     return manifest

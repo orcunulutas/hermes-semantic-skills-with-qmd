@@ -57,7 +57,7 @@ def test_exchange_admin_recall():
         out_dir.mkdir()
         manifest = build_corpus(skills, str(out_dir))
 
-        manifest_path = out_dir / "manifest.json"
+        manifest_path = out_dir / "current" / "manifest.json"
 
         idx_name = "test-hermes-skills"
 
