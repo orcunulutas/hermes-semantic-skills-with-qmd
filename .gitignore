@@ -1,0 +1,5 @@
+/tmp/hermes-agent
+/tmp/qmd
+__pycache__/
+*.pyc
+.pytest_cache/
