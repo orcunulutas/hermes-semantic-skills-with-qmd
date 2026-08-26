@@ -2,7 +2,6 @@ import logging
 from typing import Dict, Any
 
 from .qmd import run_qmd_search
-from .cli import check_qmd_executable
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ def skill_search_handler(args: Dict[str, Any], **kw: Any) -> str:
 
 def _check_fn(*args, **kw) -> bool:
     """Cheap availability check without running models."""
-    # Only expose tool if qmd is installed.
+    from .cli import check_qmd_executable
     return check_qmd_executable()
 
 def register(ctx: Any) -> None:

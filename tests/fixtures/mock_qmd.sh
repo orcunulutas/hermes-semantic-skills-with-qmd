@@ -4,5 +4,5 @@ if [ "$1" = "--version" ]; then
 elif [[ "$*" == *"collection list"* ]]; then
     echo "test-hermes-skills"
 elif [[ "$*" == *"query"* && "$*" == *"--format json"* ]]; then
-    echo '{"results": [{"file": "exchange123/references/mailbox.md", "score": 0.95}]}'
+    echo '[{"file": "qmd://test-hermes-skills/exchange123/references/mailbox.md?index=test-hermes-skills", "score": 0.95}]'
 fi

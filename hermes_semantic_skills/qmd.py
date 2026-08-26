@@ -3,7 +3,9 @@ import logging
 import subprocess
 import time
 import os
-from pathlib import Path
+import urllib.parse
+import re
+from pathlib import PurePosixPath, Path
 from typing import List, Dict, Any, Optional, Tuple
 
 from .manifest import Manifest
@@ -90,6 +92,64 @@ def _run_bounded(cmd: List[str], timeout: float, max_bytes: int = 5_000_000) -> 
             proc.kill()
             proc.wait()
 
+def _normalize_qmd_path(uri: str, index_name: str, collection_name: str) -> Optional[str]:
+    """
+    Safely extract a relative manifest path from a QMD result path or URI.
+    Returns None if malformed, insecure, or from wrong index/collection.
+    """
+    # Reject any URI scheme other than qmd
+    if "://" in uri and not uri.startswith("qmd://"):
+        return None
+
+    if uri.startswith("qmd://"):
+        parsed = urllib.parse.urlparse(uri)
+        if parsed.scheme != "qmd":
+            return None
+
+        if parsed.netloc != collection_name:
+            return None
+
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "index" in qs:
+            if len(qs["index"]) != 1 or qs["index"][0] != index_name:
+                return None
+
+        raw_path = parsed.path
+        if not raw_path.startswith("/"):
+            return None
+
+        # Reject malformed percent escapes
+        if re.search(r'%(?![a-fA-F0-9]{2})', raw_path):
+            return None
+
+        # Only URL-decode the path component
+        decoded_path = urllib.parse.unquote(raw_path)
+        norm_path = decoded_path[1:]
+    else:
+        # Do not URL-decode plain relative paths
+        norm_path = uri
+
+    # Use PurePosixPath to check traversal and absolute safely
+    if "\\" in norm_path:
+        return None
+
+    try:
+        p = PurePosixPath(norm_path)
+    except Exception:
+        return None
+
+    if p.is_absolute():
+        return None
+
+    if ".." in p.parts or "." in p.parts:
+        return None
+
+    result = p.as_posix()
+    if not result or result == ".":
+        return None
+
+    return result
+
 def run_qmd_search(
     query: str,
     limit: int = 5,
@@ -173,12 +233,12 @@ def run_qmd_search(
     except Exception:
         return format_error("qmd_error", "Malformed JSON from QMD.")
 
-    if not isinstance(qmd_output, dict):
-        return format_error("qmd_error", "Unexpected JSON shape from QMD (not an object).")
-
-    qmd_results = qmd_output.get("results")
-    if not isinstance(qmd_results, list):
-        return format_error("qmd_error", "Unexpected JSON shape from QMD ('results' is not a list).")
+    if isinstance(qmd_output, list):
+        qmd_results = qmd_output
+    elif isinstance(qmd_output, dict) and "results" in qmd_output and isinstance(qmd_output["results"], list):
+        qmd_results = qmd_output["results"]
+    else:
+        return format_error("qmd_error", "Unexpected JSON shape from QMD (must be an array or object containing 'results' array).")
 
     valid_hits = []
     for r in qmd_results:
@@ -198,9 +258,14 @@ def run_qmd_search(
         if not math.isfinite(score):
             return format_error("qmd_error", "Unexpected JSON shape from QMD ('score' is not finite).")
 
-        entry = manifest.get_entry_by_path(file_path)
+        norm_path = _normalize_qmd_path(file_path, index_name, collection_name)
+        if not norm_path:
+            logger.warning(f"Unknown/invalid result path discarded: {file_path}")
+            continue
+
+        entry = manifest.get_entry_by_path(norm_path)
         if not entry:
-            logger.warning(f"Unknown result path discarded: {file_path}")
+            logger.warning(f"Unknown manifest path discarded: {norm_path}")
             continue
 
         valid_hits.append({
