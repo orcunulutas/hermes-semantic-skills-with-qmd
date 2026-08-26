@@ -57,7 +57,7 @@ def command_build(args):
         subprocess.run(
             [
                 "qmd", "--index", "hermes-skills",
-                "collection", "add", str(corpus_dir.resolve()),
+                "collection", "add", str(corpus_dir),
                 "--name", "hermes-skills"
             ],
             capture_output=True,

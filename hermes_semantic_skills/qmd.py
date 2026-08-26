@@ -4,12 +4,91 @@ import subprocess
 import time
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from .manifest import Manifest
 from .errors import format_error, QMDError
 
 logger = logging.getLogger(__name__)
+
+class BoundedExecutionError(Exception):
+    pass
+
+class BoundedTimeoutError(BoundedExecutionError):
+    pass
+
+class BoundedOverflowError(BoundedExecutionError):
+    pass
+
+def _run_bounded(cmd: List[str], timeout: float, max_bytes: int = 5_000_000) -> Tuple[int, str, str]:
+    """
+    Run a subprocess, non-blocking stream capture, bounded by size and timeout.
+    Raises BoundedTimeoutError or BoundedOverflowError. Returns (returncode, stdout, stderr).
+    """
+    import select
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False
+    )
+
+    stdout_chunks = []
+    stderr_chunks = []
+    stdout_len = 0
+    stderr_len = 0
+
+    start_time = time.monotonic()
+
+    try:
+        os.set_blocking(proc.stdout.fileno(), False)
+        os.set_blocking(proc.stderr.fileno(), False)
+
+        while True:
+            if time.monotonic() - start_time > timeout:
+                raise BoundedTimeoutError()
+
+            reads, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
+
+            for fd in reads:
+                data = fd.read(65536)
+                if data:
+                    if fd is proc.stdout:
+                        stdout_chunks.append(data)
+                        stdout_len += len(data)
+                        if stdout_len > max_bytes:
+                            raise BoundedOverflowError()
+                    else:
+                        stderr_chunks.append(data)
+                        stderr_len += len(data)
+                        if stderr_len > max_bytes:
+                            raise BoundedOverflowError()
+
+            if proc.poll() is not None:
+                for fd in [proc.stdout, proc.stderr]:
+                    while True:
+                        data = fd.read(65536)
+                        if not data:
+                            break
+                        if fd is proc.stdout:
+                            stdout_chunks.append(data)
+                            stdout_len += len(data)
+                        else:
+                            stderr_chunks.append(data)
+                            stderr_len += len(data)
+
+                        if stdout_len > max_bytes or stderr_len > max_bytes:
+                            raise BoundedOverflowError()
+                break
+
+        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
+        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        return proc.returncode, stdout, stderr
+
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 def run_qmd_search(
     query: str,
@@ -36,27 +115,32 @@ def run_qmd_search(
     except Exception as e:
         return format_error("index_inconsistent", f"Failed to load manifest: {e}")
 
-    # Check if QMD exists
+    # Check if QMD exists (Bounded)
     try:
-        subprocess.run([qmd_executable, "--version"], capture_output=True, check=True, timeout=5, shell=False)
-    except subprocess.TimeoutExpired:
+        rc, _, _ = _run_bounded([qmd_executable, "--version"], timeout=5.0)
+        if rc != 0:
+            return format_error("qmd_missing", "qmd executable not found or failed.")
+    except BoundedTimeoutError:
         return format_error("qmd_timeout", "QMD version check timed out.")
-    except (subprocess.SubprocessError, FileNotFoundError):
+    except BoundedOverflowError:
+        return format_error("qmd_error", "QMD version check exceeded safe limit.")
+    except FileNotFoundError:
         return format_error("qmd_missing", "qmd executable not found. Install QMD and run build.")
+    except Exception as e:
+        return format_error("qmd_error", f"Failed checking qmd version: {e}")
 
-    # Check if collection exists
+    # Check if collection exists (Bounded)
     try:
-        col_res = subprocess.run(
+        rc, out, _ = _run_bounded(
             [qmd_executable, "--index", index_name, "collection", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            shell=False
+            timeout=10.0
         )
-        if collection_name not in col_res.stdout:
+        if rc == 0 and collection_name not in out:
             return format_error("collection_not_initialized", f"Collection {collection_name} not found. Rebuild index.")
-    except subprocess.TimeoutExpired:
+    except BoundedTimeoutError:
         return format_error("qmd_timeout", "QMD collection list timed out.")
+    except BoundedOverflowError:
+        return format_error("qmd_error", "QMD collection list exceeded safe limit.")
     except Exception:
         pass
 
@@ -69,85 +153,20 @@ def run_qmd_search(
         "-n", str(fetch_limit)
     ]
 
-    max_output_bytes = 5_000_000
-
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False
-        )
-
-        stdout_chunks = []
-        stderr_chunks = []
-        stdout_len = 0
-        stderr_len = 0
-
-        start_time = time.monotonic()
-        timeout = 30.0
-
-        import select
-        os.set_blocking(proc.stdout.fileno(), False)
-        os.set_blocking(proc.stderr.fileno(), False)
-
-        while True:
-            if time.monotonic() - start_time > timeout:
-                proc.kill()
-                proc.wait()
-                return format_error("qmd_timeout", "QMD search timed out.")
-
-            reads, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
-
-            for fd in reads:
-                data = fd.read(65536)
-                if data:
-                    if fd is proc.stdout:
-                        stdout_chunks.append(data)
-                        stdout_len += len(data)
-                        if stdout_len > max_output_bytes:
-                            proc.kill()
-                            proc.wait()
-                            return format_error("qmd_error", "QMD output exceeded safe limit.")
-                    else:
-                        stderr_chunks.append(data)
-                        stderr_len += len(data)
-                        if stderr_len > max_output_bytes:
-                            proc.kill()
-                            proc.wait()
-                            return format_error("qmd_error", "QMD output exceeded safe limit.")
-
-            if proc.poll() is not None:
-                # Read any remaining
-                for fd in [proc.stdout, proc.stderr]:
-                    while True:
-                        data = fd.read(65536)
-                        if not data:
-                            break
-                        if fd is proc.stdout:
-                            stdout_chunks.append(data)
-                            stdout_len += len(data)
-                        else:
-                            stderr_chunks.append(data)
-                            stderr_len += len(data)
-
-                        if stdout_len > max_output_bytes or stderr_len > max_output_bytes:
-                            proc.kill()
-                            proc.wait()
-                            return format_error("qmd_error", "QMD output exceeded safe limit.")
-                break
-
-        stdout = b"".join(stdout_chunks).decode("utf-8", errors="replace")
-        stderr = b"".join(stderr_chunks).decode("utf-8", errors="replace")
-
+        rc, stdout, stderr = _run_bounded(cmd, timeout=30.0)
+    except BoundedTimeoutError:
+        return format_error("qmd_timeout", "QMD search timed out.")
+    except BoundedOverflowError:
+        return format_error("qmd_error", "QMD output exceeded safe limit.")
     except Exception as e:
         return format_error("qmd_error", f"Failed to execute qmd: {e}")
 
-    if proc.returncode != 0:
+    if rc != 0:
         err_msg = stderr.lower() if stderr else ""
         if "model" in err_msg and ("not found" in err_msg or "load" in err_msg or "unavailable" in err_msg):
             return format_error("search_unavailable", f"QMD embedding model unavailable: {stderr.strip()[:200]}")
-        return format_error("qmd_error", f"QMD exited with code {proc.returncode}: {stderr.strip()[:200]}")
+        return format_error("qmd_error", f"QMD exited with code {rc}: {stderr.strip()[:200]}")
 
     try:
         qmd_output = json.loads(stdout)
