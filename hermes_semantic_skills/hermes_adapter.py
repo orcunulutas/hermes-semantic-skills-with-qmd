@@ -18,9 +18,8 @@ def iter_resolved_skills() -> List[ResolvedSkill]:
     Enumerate eligible installed skills using the pinned Hermes behavior.
     """
     try:
-        from tools.skills_tool import skills_list, _find_all_skills
+        from tools.skills_tool import skills_list, _parse_frontmatter, _skills_dir
         from agent.skill_utils import iter_project_skill_files, iter_skill_index_files, get_project_skills_dirs, get_external_skills_dirs
-        from tools.skills_tool import _skills_dir
     except ImportError as e:
         raise ImportError("Hermes Agent >=0.20.5 (or pinned version) is required.") from e
 
@@ -42,18 +41,19 @@ def iter_resolved_skills() -> List[ResolvedSkill]:
         seen_names = set()
 
         def _process_file(skill_md: Path, provenance: str):
-            with open(skill_md, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(2048)
+            try:
+                content = skill_md.read_text(encoding="utf-8-sig", errors="replace")
+            except Exception:
+                return
 
             load_name = skill_md.parent.name
-            if content.startswith("---"):
-                try:
-                    import yaml
-                    frontmatter = yaml.safe_load(content.split("---")[1])
-                    if frontmatter and isinstance(frontmatter, dict) and "name" in frontmatter:
-                        load_name = frontmatter["name"]
-                except Exception:
-                    pass
+
+            try:
+                frontmatter, _ = _parse_frontmatter(content)
+                if frontmatter and isinstance(frontmatter, dict) and "name" in frontmatter:
+                    load_name = frontmatter["name"]
+            except Exception:
+                pass
 
             if not load_name or load_name not in canonical_names:
                 return
@@ -76,20 +76,22 @@ def iter_resolved_skills() -> List[ResolvedSkill]:
                 "category": None
             })
 
+        # Use iter_project_skill_files to correctly apply project quarantine rules
         for proj_dir in get_project_skills_dirs():
-            # _find_all_skills uses iter_project_skill_files which we can mirror safely
-            # by looking for SKILL.md under the directory.
-            for f in Path(proj_dir).rglob("SKILL.md"):
+            for f in iter_project_skill_files(proj_dir):
                 _process_file(f, "project")
 
+        # Use iter_skill_index_files to apply profile/external exclude/support-directory rules
         active_skills_dir = _skills_dir()
         if hasattr(active_skills_dir, "exists") and active_skills_dir.exists():
-            for f in active_skills_dir.rglob("SKILL.md"):
+            for f in iter_skill_index_files(active_skills_dir, "SKILL.md"):
                 _process_file(f, "profile")
 
         for ext_dir in get_external_skills_dirs():
-            for f in Path(ext_dir).rglob("SKILL.md"):
-                _process_file(f, "external")
+            ext_path = Path(ext_dir)
+            if ext_path.exists():
+                for f in iter_skill_index_files(ext_path, "SKILL.md"):
+                    _process_file(f, "external")
 
     except Exception as e:
         logger.error(f"Failed to scan skills: {e}")

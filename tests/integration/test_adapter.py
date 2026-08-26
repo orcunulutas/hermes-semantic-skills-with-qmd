@@ -12,7 +12,8 @@ if os.path.exists(hermes_path):
 def test_adapter_discovery_and_precedence(monkeypatch):
     """
     Test that the adapter discovers project, profile, and external skills,
-    respects the canonical name from `skills_list`, and enforces precedence.
+    respects the canonical name from `skills_list`, enforces precedence,
+    and accurately skips quarantined project skills.
     """
     try:
         import agent.skill_utils
@@ -30,6 +31,7 @@ def test_adapter_discovery_and_precedence(monkeypatch):
         for d in [proj_dir, prof_dir, ext_dir]:
             d.mkdir()
 
+        # 1. Project skill (quarantined)
         s1 = proj_dir / "skill-proj"
         s1.mkdir()
         with open(s1 / "SKILL.md", "w") as f:
@@ -45,9 +47,27 @@ def test_adapter_discovery_and_precedence(monkeypatch):
         with open(s3 / "SKILL.md", "w") as f:
             f.write("---\nname: skill-ext\n---\ncontent")
 
+        def mock_iter_project(root):
+            # Explicitly mimic a quarantined project skill: it yields nothing
+            # meaning the profile skill will win.
+            return []
+
+        def mock_iter_profile(root, filename):
+            if root == prof_dir:
+                return [s2 / "SKILL.md"]
+            elif root == ext_dir:
+                return [s3 / "SKILL.md"]
+            return []
+
         monkeypatch.setattr(agent.skill_utils, "get_project_skills_dirs", lambda *args, **kwargs: [proj_dir])
         monkeypatch.setattr(agent.skill_utils, "get_external_skills_dirs", lambda *args, **kwargs: [ext_dir])
         monkeypatch.setattr(tools.skills_tool, "_skills_dir", lambda: prof_dir)
+        monkeypatch.setattr(agent.skill_utils, "iter_project_skill_files", mock_iter_project)
+        monkeypatch.setattr(agent.skill_utils, "iter_skill_index_files", mock_iter_profile)
+
+        # Mock skills_list to return success for skill-proj and skill-ext
+        mock_skills_json = '{"success": true, "skills": [{"name": "skill-proj"}, {"name": "skill-ext"}]}'
+        monkeypatch.setattr(tools.skills_tool, "skills_list", lambda *args, **kwargs: mock_skills_json)
 
         skills = iter_resolved_skills()
 
@@ -57,8 +77,9 @@ def test_adapter_discovery_and_precedence(monkeypatch):
         assert len(skills) == 2
 
         proj_skill = next(s for s in skills if s["load_name"] == "skill-proj")
-        assert proj_skill["provenance"] == "project"
-        assert str(proj_dir) in proj_skill["source_dir"]
+        # Prove it skipped project and selected profile due to quarantine
+        assert proj_skill["provenance"] == "profile"
+        assert str(prof_dir) in proj_skill["source_dir"]
 
         ext_skill = next(s for s in skills if s["load_name"] == "skill-ext")
         assert ext_skill["provenance"] == "external"
